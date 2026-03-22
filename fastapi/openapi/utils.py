@@ -28,7 +28,7 @@ from fastapi.openapi.constants import METHODS_WITH_BODY, REF_PREFIX
 from fastapi.openapi.models import OpenAPI
 from fastapi.params import Body, ParamTypes
 from fastapi.responses import Response
-from fastapi.sse import _SSE_EVENT_SCHEMA
+from fastapi.sse import _SSE_EVENT_SCHEMA, get_event_literals
 from fastapi.types import ModelNameMap
 from fastapi.utils import (
     deep_dict_update,
@@ -38,6 +38,54 @@ from fastapi.utils import (
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute
+
+def _build_sse_variant_schema(
+    event_type: Any,
+    data_types: frozenset[type],
+    model_name_map: ModelNameMap,
+) -> dict[str, Any]:
+    """Build one SSE event schema variant for OpenAPI ``itemSchema``.
+
+    Each variant is a copy of the base ``_SSE_EVENT_SCHEMA`` with:
+
+    * ``data`` replaced by a typed version (``contentMediaType`` +
+      ``contentSchema`` pointing at the data model).
+    * ``event`` constrained to ``const`` / ``enum`` when *event_type* is a
+      ``Literal``.
+    * ``required`` updated accordingly.
+    """
+    vs = copy.deepcopy(_SSE_EVENT_SCHEMA)
+
+    # Build contentSchema for the data field
+    refs: list[dict[str, Any]] = []
+    for dt in data_types:
+        schema_name = model_name_map.get(dt)
+        if schema_name:
+            refs.append({"$ref": REF_PREFIX + schema_name})
+        # Skip types not in model_name_map (e.g. scalars not needing a $ref)
+
+    if refs:
+        content_schema: dict[str, Any] = refs[0] if len(refs) == 1 else {"anyOf": refs}
+        vs["required"] = ["data"]
+        vs["properties"]["data"] = {
+            "type": "string",
+            "contentMediaType": "application/json",
+            "contentSchema": content_schema,
+        }
+
+    # Constrain the event field if event_type is a Literal
+    event_lits = get_event_literals(event_type)
+    if event_lits:
+        vs.setdefault("required", [])
+        if "event" not in vs["required"]:
+            vs["required"].append("event")
+        if len(event_lits) == 1:
+            vs["properties"]["event"] = {"type": "string", "const": event_lits[0]}
+        else:
+            vs["properties"]["event"] = {"type": "string", "enum": list(event_lits)}
+
+    return vs
+
 
 validation_error_definition = {
     "title": "ValidationError",
@@ -372,20 +420,28 @@ def get_openapi_path(
                     ).setdefault("content", {})["application/jsonl"] = jsonl_content
                 elif route.is_sse_stream:
                     sse_content: dict[str, Any] = {}
-                    item_schema = copy.deepcopy(_SSE_EVENT_SCHEMA)
-                    if route.stream_item_field:
-                        content_schema = get_schema_from_model_field(
-                            field=route.stream_item_field,
-                            model_name_map=model_name_map,
-                            field_mapping=field_mapping,
-                            separate_input_output_schemas=separate_input_output_schemas,
-                        )
-                        item_schema["required"] = ["data"]
-                        item_schema["properties"]["data"] = {
-                            "type": "string",
-                            "contentMediaType": "application/json",
-                            "contentSchema": content_schema,
-                        }
+                    if route.sse_variants:
+                        variant_schemas = [
+                            _build_sse_variant_schema(
+                                event_type, data_types, model_name_map
+                            )
+                            for event_type, data_types in route.sse_variants.items()
+                        ]
+                        if len(variant_schemas) == 1:
+                            item_schema = variant_schemas[0]
+                        else:
+                            item_schema = {"oneOf": variant_schemas}
+                            # Add discriminator only when every variant has a
+                            # Literal event constraint (all keys are Literals).
+                            if all(
+                                get_event_literals(et)
+                                for et in route.sse_variants
+                            ):
+                                item_schema["discriminator"] = {
+                                    "propertyName": "event"
+                                }
+                    else:
+                        item_schema = copy.deepcopy(_SSE_EVENT_SCHEMA)
                     sse_content["itemSchema"] = item_schema
                     operation.setdefault("responses", {}).setdefault(
                         status_code, {}

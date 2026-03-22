@@ -1,15 +1,30 @@
-from typing import Annotated, Any, Generic
+from typing import Annotated, Any, Generic, Literal, Union, get_args, get_origin
 
 from annotated_doc import Doc
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 from starlette.responses import StreamingResponse
-from typing_extensions import TypeVar
+from typing_extensions import Self, TypeVar
+
+try:
+    from types import UnionType as _UnionType
+except ImportError:  # pragma: nocover
+    _UnionType = None  # type: ignore[assignment,misc]
+
+_NoneType: type = type(None)
 
 Data = TypeVar("Data", default=Any)
 """Type variable for the `data` payload of a `ServerSentEvent`.
 
 Use ``ServerSentEvent[MyModel]`` to indicate that every event in the
 stream carries a ``MyModel`` instance as its ``data`` field.
+"""
+
+Event = TypeVar("Event", default=str | None)
+"""Type variable for the ``event`` field of a `ServerSentEvent`.
+
+Use ``ServerSentEvent[MyModel, Literal['event_name']]`` to constrain the
+``event`` field to a specific string literal, enabling discriminated unions
+in OpenAPI schema generation.
 """
 
 # Canonical SSE event schema matching the OpenAPI 3.2 spec
@@ -47,7 +62,7 @@ def _check_id_no_null(v: str | None) -> str | None:
     return v
 
 
-class ServerSentEvent(BaseModel, Generic[Data]):
+class ServerSentEvent(BaseModel, Generic[Data, Event]):
     """Represents a single Server-Sent Event.
 
     When `yield`ed from a *path operation function* that uses
@@ -108,16 +123,26 @@ class ServerSentEvent(BaseModel, Generic[Data]):
         ),
     ] = None
     event: Annotated[
-        str | None,
+        Event,
         Doc(
             """
             Optional event type name.
 
             Maps to `addEventListener(event, ...)` on the browser. When omitted,
             the browser dispatches on the generic `message` event.
+
+            The type of `event` is controlled by the type variable `Event`:
+
+            * ``ServerSentEvent[Data, Literal['item']]`` — ``event`` must be the
+              string ``'item'``; the OpenAPI schema adds ``const: "item"`` to the
+              event property.
+            * ``ServerSentEvent[Data, Literal['a', 'b']]`` — ``event`` must be one
+              of the listed strings; the schema uses ``enum``.
+            * Bare ``ServerSentEvent`` or ``ServerSentEvent[Data]`` — ``event``
+              accepts any string or ``None``, preserving backward compatibility.
             """
         ),
-    ] = None
+    ] = None  # type: ignore[assignment]
     id: Annotated[
         str | None,
         AfterValidator(_check_id_no_null),
@@ -156,7 +181,7 @@ class ServerSentEvent(BaseModel, Generic[Data]):
     ] = None
 
     @model_validator(mode="after")
-    def _check_data_exclusive(self) -> "ServerSentEvent":
+    def _check_data_exclusive(self) -> Self:
         if self.data is not None and self.raw_data is not None:
             raise ValueError(
                 "Cannot set both 'data' and 'raw_data' on the same "
@@ -245,26 +270,132 @@ KEEPALIVE_COMMENT = b": ping\n\n"
 _PING_INTERVAL: float = 15.0
 
 
+def get_event_literals(event_type: Any) -> tuple[str, ...] | None:
+    """Return the string values from a ``Literal[...]`` event type, or ``None``.
+
+    Used by the OpenAPI schema builder to decide whether to add ``const``/``enum``
+    constraints to the ``event`` property of an SSE event schema.
+    """
+    if get_origin(event_type) is Literal:
+        return get_args(event_type)
+    return None
+
+
+def _extract_single_variant(annotation: Any) -> tuple[Any, Any] | None:
+    """Extract ``(data_type, event_type)`` from a single type annotation.
+
+    Returns ``None`` for bare ``ServerSentEvent`` or ``NoneType`` (which has no
+    meaningful data payload).  All other types produce a variant:
+
+    * Parameterised ``ServerSentEvent[Data]`` → ``(Data, str | None)``
+    * Parameterised ``ServerSentEvent[Data, Event]`` → ``(Data, Event)``
+    * Plain type ``T`` → ``(T, type(None))`` — typed data, no event constraint
+
+    Pydantic's generic BaseModel creates a real subclass (not a ``_GenericAlias``),
+    so ``get_origin`` returns ``None``.  Instead we inspect
+    ``__pydantic_generic_metadata__`` which Pydantic always attaches to
+    parameterised models.
+    """
+    # Skip NoneType — it has no data payload
+    if annotation is _NoneType:
+        return None
+
+    # Parameterised ServerSentEvent subclass
+    if isinstance(annotation, type) and issubclass(annotation, ServerSentEvent):
+        if annotation is ServerSentEvent:
+            return None  # bare — no type info
+        meta = getattr(annotation, "__pydantic_generic_metadata__", None)
+        if not meta:
+            return None
+        args = meta.get("args", ())
+        if not args or isinstance(args[0], TypeVar):
+            return None
+        data_type = args[0]
+        # Use the default Event (str | None) when the second arg is absent or still a TypeVar
+        if len(args) >= 2 and not isinstance(args[1], TypeVar):
+            event_type = args[1]
+        else:
+            event_type = str | None
+        return (data_type, event_type)
+
+    # Plain type (BaseModel subclass, dataclass, scalar, …)
+    if isinstance(annotation, type):
+        return (annotation, _NoneType)
+
+    return None
+
+
+def get_sse_variants(annotation: Any) -> dict[Any, frozenset[type]] | None:
+    """Build an event-type → data-types mapping from a stream item annotation.
+
+    Handles single types, parameterised ``ServerSentEvent`` types, and unions.
+    Returns ``None`` only when the annotation is bare ``ServerSentEvent``
+    (no usable type information).
+
+    Examples::
+
+        # Single parameterised SSE
+        get_sse_variants(ServerSentEvent[Item, Literal['item']])
+        # → {Literal['item']: frozenset({Item})}
+
+        # Default event (no literal constraint)
+        get_sse_variants(ServerSentEvent[Item])
+        # → {str | None: frozenset({Item})}
+
+        # Union of SSE types
+        get_sse_variants(
+            ServerSentEvent[Item, Literal['item']]
+            | ServerSentEvent[Message, Literal['message']]
+        )
+        # → {Literal['item']: frozenset({Item}),
+        #    Literal['message']: frozenset({Message})}
+
+        # Mixed union: plain model treated as SSEVariant(T, NoneType)
+        get_sse_variants(ServerSentEvent[Item, Literal['item']] | Message)
+        # → {Literal['item']: frozenset({Item}),
+        #    type(None): frozenset({Message})}
+    """
+    origin = get_origin(annotation)
+    is_union = origin is Union or (
+        _UnionType is not None and isinstance(annotation, _UnionType)
+    )
+
+    if is_union:
+        result: dict[Any, set[type]] = {}
+        for member in get_args(annotation):
+            info = _extract_single_variant(member)
+            if info is not None:
+                data_type, event_type = info
+                result.setdefault(event_type, set()).add(data_type)
+        if not result:
+            return None
+        return {k: frozenset(v) for k, v in result.items()}
+
+    info = _extract_single_variant(annotation)
+    if info is None:
+        return None
+    data_type, event_type = info
+    return {event_type: frozenset({data_type})}
+
+
 def get_sse_data_type(annotation: Any) -> Any | None:
     """Extract the ``Data`` type from a ``ServerSentEvent[Data]`` annotation.
 
+    .. deprecated::
+        Use :func:`get_sse_variants` instead.  This wrapper is retained for
+        backward compatibility.
+
     Returns ``None`` for bare ``ServerSentEvent`` (no type parameter) or for
-    any annotation that is not a parameterized ``ServerSentEvent``.
-
-    Used by the routing layer to build the ``stream_item_field`` for OpenAPI
-    schema generation when the endpoint yields ``ServerSentEvent[Data]``.
-
-    Pydantic's generic BaseModel creates a real subclass (not a
-    ``_GenericAlias``), so ``get_origin`` returns ``None``.  Instead, we
-    inspect ``__pydantic_generic_metadata__`` which Pydantic always attaches
-    to parameterised models.
+    any annotation that is not a *single* parameterised ``ServerSentEvent``.
     """
     if not (isinstance(annotation, type) and issubclass(annotation, ServerSentEvent)):
         return None
     if annotation is ServerSentEvent:
         return None
-    meta = getattr(annotation, "__pydantic_generic_metadata__", None)
-    args = meta.get("args", ()) if meta else ()
-    if not args or isinstance(args[0], TypeVar):
+    variants = get_sse_variants(annotation)
+    if variants is None or len(variants) != 1:
         return None
-    return args[0]
+    data_types = next(iter(variants.values()))
+    if len(data_types) != 1:
+        return None
+    return next(iter(data_types))

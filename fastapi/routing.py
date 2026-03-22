@@ -26,6 +26,7 @@ from typing import (
     Annotated,
     Any,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -65,6 +66,7 @@ from fastapi.sse import (
     ServerSentEvent,
     format_sse_event,
     get_sse_data_type,
+    get_sse_variants,
 )
 from fastapi.types import DecoratedCallable, IncEx
 from fastapi.utils import (
@@ -845,6 +847,7 @@ class APIRoute(routing.Route):
         self.path = path
         self.endpoint = endpoint
         self.stream_item_type: Any | None = None
+        self.sse_variants: dict[Any, frozenset[type]] | None = None
         if isinstance(response_model, DefaultPlaceholder):
             return_annotation = get_typed_return_annotation(endpoint)
             if lenient_issubclass(return_annotation, Response):
@@ -858,23 +861,25 @@ class APIRoute(routing.Route):
                     # Bare ServerSentEvent is excluded: it's a transport
                     # wrapper with no specific data type, so it doesn't
                     # feed into validation or OpenAPI schema generation.
-                    # Parameterized ServerSentEvent[Data] is handled by
-                    # extracting Data and using it as the item type.
+                    # Parameterized ServerSentEvent[Data, Event] and unions of
+                    # SSE types are handled via get_sse_variants, which builds
+                    # an event-type → data-types mapping used for oneOf schema
+                    # generation. Plain models are also routed through here.
                     if isinstance(
                         response_class, DefaultPlaceholder
                     ) or lenient_issubclass(response_class, EventSourceResponse):
-                        sse_data_type = get_sse_data_type(stream_item)
-                        if sse_data_type is not None:
-                            # ServerSentEvent[Data]: use Data for contentSchema
-                            self.stream_item_type = sse_data_type
-                        elif lenient_issubclass(stream_item, ServerSentEvent):
-                            # Bare ServerSentEvent (no type param): transport
-                            # wrapper with no specific data type, so no
-                            # contentSchema in OpenAPI.
-                            pass
-                        else:
-                            # Plain model (e.g. Item): use as-is
-                            self.stream_item_type = stream_item
+                        variants = get_sse_variants(stream_item)
+                        if variants is not None:
+                            self.sse_variants = variants
+                            # Union of all data types ensures every referenced
+                            # model ends up in OpenAPI $defs via stream_item_field.
+                            all_data: tuple[type, ...] = tuple(
+                                dt for dts in variants.values() for dt in dts
+                            )
+                            self.stream_item_type = (
+                                Union[all_data] if len(all_data) > 1 else all_data[0]
+                            )
+                        # else: bare ServerSentEvent — no schema
                     response_model = None
                 else:
                     response_model = return_annotation

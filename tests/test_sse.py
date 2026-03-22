@@ -1,19 +1,24 @@
 import asyncio
 import time
 from collections.abc import AsyncIterable, Iterable
+from typing import Literal
 
 import fastapi.routing
 import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import EventSourceResponse
-from fastapi.sse import ServerSentEvent, get_sse_data_type
+from fastapi.sse import ServerSentEvent, get_sse_data_type, get_sse_variants
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 class Item(BaseModel):
     name: str
     description: str | None = None
+
+
+class Message(BaseModel):
+    text: str
 
 
 items = [
@@ -446,3 +451,216 @@ def test_bare_sse_openapi_has_no_content_schema():
     ]["itemSchema"]
     assert "required" not in sse_schema
     assert "contentSchema" not in sse_schema["properties"]["data"]
+
+
+# ---------------------------------------------------------------------------
+# ServerSentEvent[Data, Event] — Event type parameter tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_sse_variants_single_with_event():
+    """get_sse_variants returns correct mapping for ServerSentEvent[Data, Literal]."""
+    result = get_sse_variants(ServerSentEvent[Item, Literal["item"]])
+    assert result is not None
+    assert len(result) == 1
+    key = next(iter(result))
+    assert key == Literal["item"]
+    assert result[key] == frozenset({Item})
+
+
+def test_get_sse_variants_single_data_only():
+    """get_sse_variants maps to str|None event key for ServerSentEvent[Data]."""
+    result = get_sse_variants(ServerSentEvent[Item])
+    assert result is not None
+    assert len(result) == 1
+    event_type = next(iter(result))
+    assert event_type == (str | None)
+    assert result[event_type] == frozenset({Item})
+
+
+def test_get_sse_variants_bare_returns_none():
+    """Bare ServerSentEvent returns None from get_sse_variants."""
+    assert get_sse_variants(ServerSentEvent) is None
+
+
+def test_get_sse_variants_union():
+    """get_sse_variants groups data types by event type for union annotations."""
+    annotation = (
+        ServerSentEvent[Item, Literal["item"]]
+        | ServerSentEvent[Message, Literal["message"]]
+    )
+    result = get_sse_variants(annotation)
+    assert result is not None
+    assert len(result) == 2
+    item_key = Literal["item"]
+    msg_key = Literal["message"]
+    assert result[item_key] == frozenset({Item})
+    assert result[msg_key] == frozenset({Message})
+
+
+def test_get_sse_variants_shared_event_merges_data_types():
+    """Union members sharing the same Event literal merge their Data types."""
+    annotation = (
+        ServerSentEvent[Item, Literal["update"]]
+        | ServerSentEvent[Message, Literal["update"]]
+    )
+    result = get_sse_variants(annotation)
+    assert result is not None
+    assert len(result) == 1
+    assert result[Literal["update"]] == frozenset({Item, Message})
+
+
+def test_get_sse_variants_plain_model():
+    """Plain model T is treated as SSEVariant(T, NoneType)."""
+    result = get_sse_variants(Item)
+    assert result is not None
+    assert result[type(None)] == frozenset({Item})
+
+
+def test_sse_event_literal_validates_wrong_value():
+    """ServerSentEvent[Item, Literal['item']] rejects event='wrong'."""
+    item = Item(name="Foo")
+    with pytest.raises(ValidationError):
+        ServerSentEvent[Item, Literal["item"]](data=item, event="wrong")
+
+
+def test_sse_event_literal_accepts_correct_value():
+    """ServerSentEvent[Item, Literal['item']] accepts event='item'."""
+    item = Item(name="Foo")
+    evt = ServerSentEvent[Item, Literal["item"]](data=item, event="item")
+    assert evt.event == "item"
+
+
+def test_sse_event_literal_rejects_none():
+    """ServerSentEvent[Item, Literal['item']] rejects None event (validate_default)."""
+    item = Item(name="Foo")
+    with pytest.raises(ValidationError):
+        ServerSentEvent[Item, Literal["item"]](data=item)
+
+
+# App-level tests for discriminated union SSE schema generation
+
+_discriminated_app = FastAPI()
+
+
+@_discriminated_app.get("/stream", response_class=EventSourceResponse)
+async def _stream_discriminated() -> AsyncIterable[
+    ServerSentEvent[Item, Literal["item"]] | ServerSentEvent[Message, Literal["message"]]
+]:
+    yield ServerSentEvent[Item, Literal["item"]](
+        data=Item(name="Plumbus", description=None), event="item"
+    )
+    yield ServerSentEvent[Message, Literal["message"]](
+        data=Message(text="hello"), event="message"
+    )
+
+
+def test_discriminated_union_streams_correctly():
+    with TestClient(_discriminated_app) as c:
+        response = c.get("/stream")
+    assert response.status_code == 200
+    lines = response.text.split("\n")
+    event_lines = [l for l in lines if l.startswith("event: ")]
+    assert event_lines == ["event: item", "event: message"]
+
+
+def test_discriminated_union_openapi_one_of():
+    """Union of SSE types produces oneOf with discriminator in itemSchema."""
+    with TestClient(_discriminated_app) as c:
+        response = c.get("/openapi.json")
+    schema = response.json()
+    sse_schema = schema["paths"]["/stream"]["get"]["responses"]["200"]["content"][
+        "text/event-stream"
+    ]["itemSchema"]
+
+    assert "oneOf" in sse_schema
+    assert sse_schema.get("discriminator") == {"propertyName": "event"}
+
+    variants = sse_schema["oneOf"]
+    assert len(variants) == 2
+
+    # Find item variant
+    item_variant = next(v for v in variants if v.get("properties", {}).get("event", {}).get("const") == "item")
+    assert "event" in item_variant.get("required", [])
+    assert "data" in item_variant.get("required", [])
+    assert item_variant["properties"]["data"]["contentMediaType"] == "application/json"
+    assert "$ref" in item_variant["properties"]["data"]["contentSchema"]
+    assert "Item" in item_variant["properties"]["data"]["contentSchema"]["$ref"]
+
+    # Find message variant
+    msg_variant = next(v for v in variants if v.get("properties", {}).get("event", {}).get("const") == "message")
+    assert "$ref" in msg_variant["properties"]["data"]["contentSchema"]
+    assert "Message" in msg_variant["properties"]["data"]["contentSchema"]["$ref"]
+
+
+def test_single_sse_with_event_literal_schema():
+    """Single ServerSentEvent[Data, Literal['x']] produces const event in itemSchema."""
+    app = FastAPI()
+
+    @app.get("/stream", response_class=EventSourceResponse)
+    async def _stream() -> AsyncIterable[ServerSentEvent[Item, Literal["item"]]]:
+        yield ServerSentEvent[Item, Literal["item"]](data=Item(name="x"), event="item")
+
+    with TestClient(app) as c:
+        response = c.get("/openapi.json")
+    schema = response.json()
+    sse_schema = schema["paths"]["/stream"]["get"]["responses"]["200"]["content"][
+        "text/event-stream"
+    ]["itemSchema"]
+
+    # Single variant — no oneOf wrapper
+    assert "oneOf" not in sse_schema
+    assert sse_schema["properties"]["event"] == {"type": "string", "const": "item"}
+    assert "event" in sse_schema.get("required", [])
+    assert "data" in sse_schema.get("required", [])
+
+
+def test_multi_literal_event_produces_enum():
+    """Literal['a', 'b'] event type produces enum in OpenAPI schema."""
+    app = FastAPI()
+
+    @app.get("/stream", response_class=EventSourceResponse)
+    async def _stream() -> AsyncIterable[ServerSentEvent[Item, Literal["a", "b"]]]:
+        yield ServerSentEvent[Item, Literal["a", "b"]](data=Item(name="x"), event="a")
+
+    with TestClient(app) as c:
+        response = c.get("/openapi.json")
+    schema = response.json()
+    sse_schema = schema["paths"]["/stream"]["get"]["responses"]["200"]["content"][
+        "text/event-stream"
+    ]["itemSchema"]
+    assert sse_schema["properties"]["event"] == {"type": "string", "enum": ["a", "b"]}
+
+
+def test_mixed_union_no_discriminator():
+    """Mixed union (SSE + plain model) produces oneOf but no discriminator."""
+    app = FastAPI()
+
+    @app.get("/stream", response_class=EventSourceResponse)
+    async def _stream() -> AsyncIterable[
+        ServerSentEvent[Item, Literal["item"]] | Message
+    ]:
+        yield ServerSentEvent[Item, Literal["item"]](data=Item(name="x"), event="item")
+        yield Message(text="bye")  # type: ignore[misc]
+
+    with TestClient(app) as c:
+        response = c.get("/openapi.json")
+    schema = response.json()
+    sse_schema = schema["paths"]["/stream"]["get"]["responses"]["200"]["content"][
+        "text/event-stream"
+    ]["itemSchema"]
+
+    assert "oneOf" in sse_schema
+    # Not all variants have event literals (Message has NoneType key), so no discriminator
+    assert "discriminator" not in sse_schema
+    variants = sse_schema["oneOf"]
+    assert len(variants) == 2
+
+    # The item variant has event constraint
+    item_v = next(v for v in variants if v.get("properties", {}).get("event", {}).get("const") == "item")
+    assert item_v is not None
+
+    # The Message variant has no event constraint
+    msg_v = next(v for v in variants if "const" not in v.get("properties", {}).get("event", {}))
+    assert "$ref" in msg_v["properties"]["data"]["contentSchema"]
+    assert "Message" in msg_v["properties"]["data"]["contentSchema"]["$ref"]
